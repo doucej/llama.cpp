@@ -193,7 +193,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-server-component.cpp)
     target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-component PRIVATE server-context)
-    llama_build_and_test(test-json-schema-to-grammar.cpp)
+
+    llama_build_and_test(test-durable-prefix-cache.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    target_include_directories(test-durable-prefix-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-durable-prefix-cache PRIVATE server-context)
+
+    llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    target_include_directories(test-json-schema-to-grammar PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)

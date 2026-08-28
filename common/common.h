@@ -579,6 +579,15 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
 
+     // durable prefix KV cache for llama-server (disabled by default)
+     bool        durable_cache_enabled       = false;
+     std::string durable_cache_dir           = "";
+     size_t      durable_cache_max_bytes     = 2ull * 1024 * 1024 * 1024; // 2 GiB
+     int32_t     durable_cache_ttl_days      = 7;
+     int32_t     durable_cache_min_tokens    = 2048; // minimum prefix length to consider for a hit/save
+     int32_t     durable_cache_fixed_tokens  = 0;    // if > 0, overrides durable_cache_min_tokens as the exact cached prefix length
+     int32_t     durable_cache_max_tokens    = 0;    // if > 0, caps cached prefix length (0 means no upper bound)
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
