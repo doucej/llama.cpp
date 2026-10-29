@@ -151,9 +151,11 @@ namespace prefix_cache {
         // Validation performed before import (each miss has a distinct reason_cstr):
         //   - metadata schema version mismatch, checksum mismatch, missing or wrong fingerprint/key bytes,
         //     file ownership / mode violation, symlink detection, entry older than cfg.ttl_days
+        // min_useful: only entries longer than this many tokens are considered (the caller already has that much)
         load_result lookup(
                 const int32_t * task_tokens,
-                size_t         task_n_tokens);
+                size_t         task_n_tokens,
+                size_t         min_useful = 0);
 
         // housekeeping: walk the configured root directory and remove expired entries; if combined size is
         // still over `config.max_bytes`, evict oldest by access time until under. Returns number of entry
@@ -171,7 +173,7 @@ namespace prefix_cache {
                 uint32_t        n);
 
         // distinct stored prefix lengths for the current fingerprint that fit this task, longest first
-        std::vector<uint32_t> stored_prefix_lengths(size_t task_n_tokens) const;
+        std::vector<uint32_t> stored_prefix_lengths(size_t task_n_tokens, size_t min_useful) const;
 
         config cfg;
         bool   fp_valid       = false;

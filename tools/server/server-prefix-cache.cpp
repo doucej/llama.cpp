@@ -484,7 +484,7 @@ namespace prefix_cache {
         return res;
     }
 
-    std::vector<uint32_t> manager::stored_prefix_lengths(size_t task_n_tokens) const {
+    std::vector<uint32_t> manager::stored_prefix_lengths(size_t task_n_tokens, size_t min_useful) const {
         std::vector<uint32_t> lens;
         const size_t n_max = cfg.effective_prefix_for_task(task_n_tokens);
         if (n_max == 0 || user_root_.empty()) {
@@ -503,7 +503,7 @@ namespace prefix_cache {
                 continue;
             }
             const uint64_t L = tc->get<uint64_t>();
-            if (L >= (uint64_t)cfg.min_prefix_tokens && L <= n_max) {
+            if (L >= (uint64_t)cfg.min_prefix_tokens && L > (uint64_t)min_useful && L <= n_max) {
                 lens.push_back((uint32_t)L);
             }
         }
@@ -513,7 +513,7 @@ namespace prefix_cache {
         return lens;
     }
 
-    load_result manager::lookup(const int32_t * task_tokens, size_t task_n_tokens) {
+    load_result manager::lookup(const int32_t * task_tokens, size_t task_n_tokens, size_t min_useful) {
         load_result res;
         if (!cfg.enabled || user_root_.empty() || !fp_valid || task_tokens == nullptr) {
             return lookup_exact(task_tokens, task_n_tokens, 0);
@@ -525,11 +525,16 @@ namespace prefix_cache {
 
         // fixed-length mode: exactly one candidate length
         if (cfg.fixed_prefix > 0) {
-            return lookup_exact(task_tokens, task_n_tokens, (uint32_t)cfg.effective_prefix_for_task(task_n_tokens));
+            const size_t n_fixed = cfg.effective_prefix_for_task(task_n_tokens);
+            if (n_fixed <= min_useful) {
+                res.reason = "not_useful";
+                return res;
+            }
+            return lookup_exact(task_tokens, task_n_tokens, (uint32_t)n_fixed);
         }
 
         // variable mode: any stored entry whose length is a prefix of this request may hit
-        const auto lens = stored_prefix_lengths(task_n_tokens);
+        const auto lens = stored_prefix_lengths(task_n_tokens, min_useful);
         if (lens.empty()) {
             res.reason = "not_found";
             return res;

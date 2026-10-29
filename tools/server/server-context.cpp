@@ -2073,13 +2073,10 @@ private:
             // try durable load when the slot's current content covers little of the incoming task:
             // f_sim = common-prefix length / task token count; low f_sim means the slot KV is mostly
             // irrelevant to this request so importing a durable entry can only help
+            // a durable entry is only useful if it is longer than what the slot already matches
             const size_t lcp_with_task = ret->prompt.tokens.get_common_prefix(task.tokens);
-            const float  f_sim         = task.tokens.size() > 0
-                                             ? float(lcp_with_task) / task.tokens.size()
-                                             : 0.0f;
-            const bool durable_load_candidate = f_sim < 0.5f;
 
-            if (durable_load_candidate && slot_prefix_eligible(*ret, task.tokens)) {
+            if (slot_prefix_eligible(*ret, task.tokens)) {
                 auto * mgr = prefix_durable_get();
                 if (mgr != nullptr) {
                     std::vector<int32_t> tok;
@@ -2088,7 +2085,7 @@ private:
                             tok.push_back(t);
                         }
                     }
-                    auto res = mgr->lookup(tok.data(), tok.size());
+                    auto res = mgr->lookup(tok.data(), tok.size(), lcp_with_task);
                     if (res.hit && !res.state_data.empty()) {
                         SLT_INF(*ret, "durable cache hit for %zu tokens\n", res.prefix_tokens.size());
 
