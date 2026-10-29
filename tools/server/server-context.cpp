@@ -1179,6 +1179,10 @@ private:
 
     // save points for this task, ascending: the first user message start (stable system/tools prefix)
     // and the whole prompt minus one token (kept so a later request that extends this prompt can match)
+    // text tokens of the most recently started prompts (newest first); used to find where prompts diverge
+    static constexpr size_t DURABLE_RECENT_PROMPTS = 4;
+    std::vector<llama_tokens> durable_recent_prompts;
+
     std::vector<size_t> durable_save_points(const server_slot & slot) const {
         std::vector<size_t> pts;
         if (!prefix_durable_active() || !slot_prefix_eligible(slot, slot.task->tokens)) {
@@ -1192,10 +1196,25 @@ private:
         }
 
         if (cfg.fixed_prefix == 0) {
+            const auto & cur = slot.task->tokens.get_tokens();
+
             const int32_t fu = slot.task->params.message_spans.first_user_message_pos();
-            if (fu > 0 && (size_t) fu < slot.task->tokens.size() &&
-                cfg.effective_prefix((size_t) fu) == (size_t) fu) {
+            if (fu > 0 && (size_t) fu < cur.size() && cfg.effective_prefix((size_t) fu) == (size_t) fu) {
                 pts.push_back((size_t) fu);
+            }
+
+            // divergence from each recent prompt, only before the first user message
+            // (shared system/tools block that differs per working directory, for example)
+            const size_t lim_div = fu > 0 ? (size_t) fu : cur.size();
+            for (const auto & prev : durable_recent_prompts) {
+                const size_t lim_prev = std::min(prev.size(), cur.size());
+                size_t lcp = 0;
+                while (lcp < lim_prev && prev[lcp] == cur[lcp]) {
+                    lcp++;
+                }
+                if (lcp < lim_div && cfg.effective_prefix(lcp) == lcp) {
+                    pts.push_back(lcp);
+                }
             }
         }
 
@@ -2085,7 +2104,9 @@ private:
                             tok.push_back(t);
                         }
                     }
-                    auto res = mgr->lookup(tok.data(), tok.size(), lcp_with_task);
+                    auto res = mgr->lookup(tok.data(), tok.size());
+                    SLT_TRC(*ret, "durable lookup: ram_lcp = %zu, candidate = %zu, hit = %d, reason = %s\n",
+                            lcp_with_task, res.prefix_tokens.size(), (int) res.hit, res.reason_cstr());
                     if (res.hit && !res.state_data.empty()) {
                         SLT_INF(*ret, "durable cache hit for %zu tokens\n", res.prefix_tokens.size());
 
@@ -4571,9 +4592,22 @@ private:
                         slot.durable_pending.clear();
                         if (!slot.durable_imported) {
                             for (const size_t pt : durable_save_points(slot)) {
-                                if (pt > (size_t) n_past) {
+                                if (pt >= (size_t) n_past) {
                                     slot.durable_pending.push_back(pt);
                                 }
+                            }
+                        }
+                        {
+                            llama_tokens text;
+                            for (const auto t : slot.task->tokens.get_tokens()) {
+                                if (t == LLAMA_TOKEN_NULL) {
+                                    break;
+                                }
+                                text.push_back(t);
+                            }
+                            durable_recent_prompts.insert(durable_recent_prompts.begin(), std::move(text));
+                            if (durable_recent_prompts.size() > DURABLE_RECENT_PROMPTS) {
+                                durable_recent_prompts.pop_back();
                             }
                         }
 
@@ -4606,6 +4640,12 @@ private:
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
                     slot.mem.seq_rm(slot.id, p0, -1);
+
+                    // a save point equal to the reused prefix: the KV now holds exactly that prefix, export it here
+                    if (!slot.durable_pending.empty() && slot.prompt.n_tokens() == (int) slot.durable_pending.front()) {
+                        save_durable_prefix(slot, slot.durable_pending.front());
+                        slot.durable_pending.erase(slot.durable_pending.begin());
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
