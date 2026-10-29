@@ -196,6 +196,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_link_libraries(test-server-component PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp  LABEL behavior)
 
+    llama_build_and_test(test-durable-prefix-cache.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    target_include_directories(test-durable-prefix-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-durable-prefix-cache PRIVATE server-context)
+
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
     endif()

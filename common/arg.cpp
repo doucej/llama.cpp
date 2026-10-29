@@ -1897,6 +1897,58 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
+        {"--durable-cache"}, "on|off",
+        string_format("enable durable (disk-backed) prefix KV cache for llama-server (default: %s)", params.durable_cache_enabled ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if      (value == "on")  params.durable_cache_enabled = true;
+            else if (value == "off") params.durable_cache_enabled = false;
+            else throw std::runtime_error("expected 'on' or 'off'");
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--durable-cache-dir"}, "DIR",
+        string_format("directory for durable prefix cache entries (default: %s)", params.durable_cache_dir.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.durable_cache_dir = value;
+            if (!params.durable_cache_dir.empty()) params.durable_cache_enabled = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--durable-cache-limit"}, "MiB",
+        string_format("maximum bytes for durable cache entries across all users (default: %zu MiB = %.1f GiB)", params.durable_cache_max_bytes / 1048576, (double)params.durable_cache_max_bytes / 1073741824.0),
+        [](common_params & params, int value) {
+            params.durable_cache_max_bytes = (size_t)value * 1048576ull;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--durable-cache-ttl"}, "DAYS",
+        string_format("entries older than DAYS days are evicted (default: %d)", params.durable_cache_ttl_days),
+        [](common_params & params, int value) {
+            params.durable_cache_ttl_days = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--durable-cache-min-tokens"}, "N",
+        string_format("minimum prompt tokens for an entry to be saved and matched (default: %d)", params.durable_cache_min_tokens),
+        [](common_params & params, int value) {
+            params.durable_cache_min_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"--durable-cache-prefix-tokens"}, "N",
+         string_format("if > 0, cache exactly the first N prompt tokens, otherwise use --durable-cache-min-tokens (default: %d)", params.durable_cache_fixed_tokens),
+         [](common_params & params, int value) {
+             params.durable_cache_fixed_tokens = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"--durable-cache-max-tokens"}, "N",
+         string_format("if > 0, cap cached prefix length to at most N tokens (0 = no upper bound, default: %d)", params.durable_cache_max_tokens),
+         [](common_params & params, int value) {
+             params.durable_cache_max_tokens = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-r", "--reverse-prompt"}, "PROMPT",
         "halt generation at PROMPT, return control in interactive mode\n",
         [](common_params & params, const std::string & value) {
