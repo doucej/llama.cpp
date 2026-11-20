@@ -12,6 +12,15 @@
 #include "server-schema.h"
 #include "server-slot-sched.h"
 #include "server-stream.h"
+#include "server-prefix-cache.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include "sha256.h"
+#ifdef __cplusplus
+}
+#endif
 
 #include "build-info.h"
 #include "common.h"
@@ -339,6 +348,12 @@ struct server_slot {
     bool has_new_line   = false;
     bool truncated      = false;
 
+    // durable prefix cache: prompt token positions still waiting to be saved to disk (ascending)
+    std::vector<size_t> durable_pending;
+
+    // durable prefix cache: set when the current task adopted a prompt state imported from disk
+    bool durable_imported = false;
+
     stop_type stop;
 
     std::string stopping_word;
@@ -480,6 +495,9 @@ struct server_slot {
         audio_commit_rows.clear();
         inp_embd.clear();
         rt.reset();
+
+        durable_pending.clear();
+        durable_imported = false;
     }
 
     void init_sampler() const {
@@ -1132,6 +1150,167 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    // durable prefix cache (disabled unless --durable-cache on)
+    std::unique_ptr<prefix_cache::manager> prefix_durable;
+
+     prefix_cache::config cfg_prefix_durable() const {
+         prefix_cache::config pcfg;
+         pcfg.enabled           = params_base.durable_cache_enabled && !params_base.durable_cache_dir.empty();
+         pcfg.root_dir          = params_base.durable_cache_dir;
+         pcfg.max_bytes         = params_base.durable_cache_max_bytes;
+         pcfg.ttl_days          = params_base.durable_cache_ttl_days;
+         pcfg.min_prefix_tokens = params_base.durable_cache_min_tokens;
+         pcfg.fixed_prefix      = params_base.durable_cache_fixed_tokens;
+         pcfg.max_prefix_tokens = params_base.durable_cache_max_tokens;
+         return pcfg;
+     }
+
+    bool prefix_durable_active() const {
+        if (ctx_tgt == nullptr || model_tgt == nullptr) {
+            return false;
+        }
+        // speculative / draft not supported by the durable path
+        if (spec_init != nullptr) {
+            return false;
+        }
+        if (!cfg_prefix_durable().enabled) {
+            return false;
+        }
+        return true;
+    }
+
+    bool slot_prefix_eligible(const server_slot & slot, const server_tokens & tokens) const {
+        // target-only slots only (no draft context on this slot)
+        if (slot.ctx_dft != nullptr) {
+            return false;
+        }
+        // no LoRA applied on the slot - a cached entry is not bound to a particular adapter set here, so we skip entirely
+        if (!slot.lora.empty()) {
+            return false;
+        }
+        // multimodal tokens are represented as LLAMA_TOKEN_NULL in the token list
+        const llama_tokens & src = tokens.get_tokens();
+        for (auto t : src) {
+            if (t == LLAMA_TOKEN_NULL) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // save points for this task, ascending: the first user message start (stable system/tools prefix)
+    // and the whole prompt minus one token (kept so a later request that extends this prompt can match)
+    // text tokens of the most recently started prompts (newest first); used to find where prompts diverge
+    static constexpr size_t DURABLE_RECENT_PROMPTS = 4;
+    std::vector<llama_tokens> durable_recent_prompts;
+
+    std::vector<size_t> durable_save_points(const server_slot & slot) const {
+        std::vector<size_t> pts;
+        if (!prefix_durable_active() || !slot_prefix_eligible(slot, slot.task->tokens)) {
+            return pts;
+        }
+
+        const auto & cfg = cfg_prefix_durable();
+        const size_t n_tail = cfg.effective_prefix_for_task(slot.task->tokens.size());
+        if (n_tail > 0) {
+            pts.push_back(n_tail);
+        }
+
+        if (cfg.fixed_prefix == 0) {
+            const auto & cur = slot.task->tokens.get_tokens();
+
+            const int32_t fu = slot.task->params.message_spans.first_user_message_pos();
+            if (fu > 0 && (size_t) fu < cur.size() && cfg.effective_prefix((size_t) fu) == (size_t) fu) {
+                pts.push_back((size_t) fu);
+            }
+
+            // divergence from each recent prompt, only before the first user message
+            // (shared system/tools block that differs per working directory, for example)
+            const size_t lim_div = fu > 0 ? (size_t) fu : cur.size();
+            for (const auto & prev : durable_recent_prompts) {
+                const size_t lim_prev = std::min(prev.size(), cur.size());
+                size_t lcp = 0;
+                while (lcp < lim_prev && prev[lcp] == cur[lcp]) {
+                    lcp++;
+                }
+                if (lcp < lim_div && cfg.effective_prefix(lcp) == lcp) {
+                    pts.push_back(lcp);
+                }
+            }
+        }
+
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        return pts;
+    }
+
+    void save_durable_prefix(server_slot & slot, size_t prefix_n) {
+        if (prefix_n == 0) {
+            return;
+        }
+
+        auto * mgr = prefix_durable_get();
+        if (mgr == nullptr) {
+            return;
+        }
+
+        std::vector<int32_t> tok;
+        tok.reserve(prefix_n);
+        for (size_t i = 0; i < prefix_n; ++i) {
+            tok.push_back(slot.task->tokens[i]);
+        }
+
+        auto res = mgr->save(ctx_tgt, slot.id, std::move(tok), llama_build_info());
+        if (!res.ok && !res.already) {
+            SLT_TRC(slot, "durable cache save miss: %s\n", res.err.c_str());
+        } else {
+            SLT_INF(slot, "durable cache saved %zu prefix tokens (%s)\n", prefix_n, res.already ? "already" : "new");
+        }
+    }
+    prefix_cache::manager * prefix_durable_get() {
+        if (!prefix_durable) {
+            const std::string model_path = params_base.model.get_name();
+
+            bool have_model = false;
+            prefix_cache::sha256_digest gguf_sha = {};
+            if (!model_path.empty() && std::filesystem::is_regular_file(model_path)) {
+                std::ifstream f(model_path, std::ios::binary);
+                if (f) {
+                    sha256_t h;
+                    sha256_init(&h);
+                    std::vector<uint8_t> buf(1ull << 20);
+                    while (f) {
+                        f.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)buf.size());
+                        const auto n = f.gcount();
+                        if (n <= 0) {
+                            break;
+                        }
+                        sha256_update(&h, buf.data(), (size_t)n);
+                    }
+                    unsigned char out[SHA256_DIGEST_SIZE];
+                    sha256_final(&h, out);
+                    for (int i = 0; i < SHA256_DIGEST_SIZE; ++i) {
+                        gguf_sha[i] = (uint8_t)out[i];
+                    }
+                    have_model = true;
+                } else {
+                    SRV_WRN("durable cache: cannot read model file '%s', disabled\n", model_path.c_str());
+                }
+            } else {
+                SRV_WRN("%s", "durable cache: model path unavailable, disabled\n");
+            }
+
+            prefix_durable.reset(new prefix_cache::manager(cfg_prefix_durable()));
+            if (have_model) {
+                prefix_durable->set_model(params_base, model_path, gguf_sha);
+            }
+            // best-effort housekeeping on first use; failures never fail inference
+            prefix_durable->cleanup();
+        }
+
+        return prefix_durable.get();
+    }
 
     server_metrics metrics;
 
@@ -1848,6 +2027,63 @@ private:
         prompt_cache->update();
 
         SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+    }
+
+    // durable prefix cache: import a stored prefix into an idle slot before the task launches
+    void durable_try_load(server_slot & slot, const server_task & task) {
+        if (!prefix_durable_active() || !slot_prefix_eligible(slot, task.tokens)) {
+            return;
+        }
+
+        auto * mgr = prefix_durable_get();
+        if (mgr == nullptr) {
+            return;
+        }
+
+        std::vector<int32_t> tok;
+        for (auto t : task.tokens.get_tokens()) {
+            if (t != LLAMA_TOKEN_NULL) {
+                tok.push_back(t);
+            }
+        }
+
+        auto res = mgr->lookup(tok.data(), tok.size());
+        SLT_TRC(slot, "durable lookup: candidate = %zu, hit = %d, reason = %s\n",
+                res.prefix_tokens.size(), (int) res.hit, res.reason_cstr());
+        if (!res.hit || res.state_data.empty()) {
+            return;
+        }
+
+        SLT_INF(slot, "durable cache hit for %zu tokens\n", res.prefix_tokens.size());
+
+        const size_t n_written = llama_state_seq_set_data_ext(ctx_tgt, res.state_data.data(), res.state_data.size(), slot.id, 0);
+        if (n_written != res.state_data.size()) {
+            slot.prompt_clear();
+            SLT_WRN(slot, "durable cache import failed (n_written=%zu/size=%zu)\n", n_written, res.state_data.size());
+            return;
+        }
+
+        // adopt the imported prefix as the slot prompt
+        llama_tokens clean;
+        for (auto t : task.tokens.get_tokens()) {
+            if (t == LLAMA_TOKEN_NULL) {
+                break;
+            }
+            clean.push_back(t);
+        }
+        const size_t n_adopt = std::min(res.prefix_tokens.size(), clean.size());
+        clean.resize(n_adopt);
+
+        slot.prompt.tokens = server_tokens(clean, false);
+        slot.prompt.checkpoints.clear();
+        slot.durable_imported = true;
+
+        // synthesized checkpoint: lets STARTED accept n_past = n_adopt without re-decoding the prefix
+        // a checkpoint that does not load falls back to full re-processing
+        auto ckpt = std::make_shared<common_prompt_checkpoint>();
+        ckpt->update_pos((int64_t) n_adopt, 0, (llama_pos) n_adopt);
+        ckpt->update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        slot.prompt.checkpoints.push_back(std::move(ckpt));
     }
 
     // return true if at least one slot has been cleared
@@ -3019,6 +3255,10 @@ private:
                     // the task is not deferred past this point
                     if (plan.update_cache && prompt_cache) {
                         update_prompt_cache(*slot, task);
+                    }
+
+                    if (task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_parent() && task.params.cache_prompt) {
+                        durable_try_load(*slot, task);
                     }
 
                     if (task.is_parent()) {
@@ -4271,6 +4511,29 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // save points already behind the reused prefix are skipped; imported prefixes are not re-saved
+                        slot.durable_pending.clear();
+                        if (!slot.durable_imported) {
+                            for (const size_t pt : durable_save_points(slot)) {
+                                if (pt >= (size_t) n_past) {
+                                    slot.durable_pending.push_back(pt);
+                                }
+                            }
+                        }
+                        {
+                            llama_tokens text;
+                            for (const auto t : slot.task->tokens.get_tokens()) {
+                                if (t == LLAMA_TOKEN_NULL) {
+                                    break;
+                                }
+                                text.push_back(t);
+                            }
+                            durable_recent_prompts.insert(durable_recent_prompts.begin(), std::move(text));
+                            if (durable_recent_prompts.size() > DURABLE_RECENT_PROMPTS) {
+                                durable_recent_prompts.pop_back();
+                            }
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -4300,6 +4563,12 @@ private:
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
                     slot.mem.seq_rm(slot.id, p0, -1);
+
+                    // a save point equal to the reused prefix: the KV now holds exactly that prefix, export it here
+                    if (!slot.durable_pending.empty() && slot.prompt.n_tokens() == (int) slot.durable_pending.front()) {
+                        save_durable_prefix(slot, slot.durable_pending.front());
+                        slot.durable_pending.erase(slot.durable_pending.begin());
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -4407,6 +4676,11 @@ private:
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                        // hold the batch at a save point so its state can be exported before more tokens are added
+                        if (!slot.durable_pending.empty() && slot.prompt.n_tokens() == (int) slot.durable_pending.front()) {
+                            break;
+                        }
+
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4772,6 +5046,12 @@ private:
         };
 
         iterate(slots, [&](server_slot & slot) {
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task != nullptr &&
+                !slot.durable_pending.empty() && slot.prompt.n_tokens() == (int) slot.durable_pending.front()) {
+                save_durable_prefix(slot, slot.durable_pending.front());
+                slot.durable_pending.erase(slot.durable_pending.begin());
+            }
+
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
