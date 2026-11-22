@@ -1180,6 +1180,18 @@ private:
         return true;
     }
 
+    // text tokens up to the first media chunk; does not assert on prompts with mtmd enabled
+    static llama_tokens durable_text_prefix(const server_tokens & t) {
+        llama_tokens res;
+        for (size_t i = 0; i < t.size(); ++i) {
+            if (t[i] == LLAMA_TOKEN_NULL) {
+                break;
+            }
+            res.push_back(t[i]);
+        }
+        return res;
+    }
+
     bool slot_prefix_eligible(const server_slot & slot, const server_tokens & tokens) const {
         // target-only slots only (no draft context on this slot)
         if (slot.ctx_dft != nullptr) {
@@ -1190,9 +1202,8 @@ private:
             return false;
         }
         // multimodal tokens are represented as LLAMA_TOKEN_NULL in the token list
-        const llama_tokens & src = tokens.get_tokens();
-        for (auto t : src) {
-            if (t == LLAMA_TOKEN_NULL) {
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (tokens[i] == LLAMA_TOKEN_NULL) {
                 return false;
             }
         }
@@ -1218,7 +1229,7 @@ private:
         }
 
         if (cfg.fixed_prefix == 0) {
-            const auto & cur = slot.task->tokens.get_tokens();
+            const llama_tokens cur = durable_text_prefix(slot.task->tokens);
 
             const int32_t fu = slot.task->params.message_spans.first_user_message_pos();
             if (fu > 0 && (size_t) fu < cur.size() && cfg.effective_prefix((size_t) fu) == (size_t) fu) {
@@ -2041,9 +2052,9 @@ private:
         }
 
         std::vector<int32_t> tok;
-        for (auto t : task.tokens.get_tokens()) {
-            if (t != LLAMA_TOKEN_NULL) {
-                tok.push_back(t);
+        for (size_t i = 0; i < task.tokens.size(); ++i) {
+            if (task.tokens[i] != LLAMA_TOKEN_NULL) {
+                tok.push_back(task.tokens[i]);
             }
         }
 
@@ -2064,13 +2075,7 @@ private:
         }
 
         // adopt the imported prefix as the slot prompt
-        llama_tokens clean;
-        for (auto t : task.tokens.get_tokens()) {
-            if (t == LLAMA_TOKEN_NULL) {
-                break;
-            }
-            clean.push_back(t);
-        }
+        llama_tokens clean = durable_text_prefix(task.tokens);
         const size_t n_adopt = std::min(res.prefix_tokens.size(), clean.size());
         clean.resize(n_adopt);
 
@@ -4520,14 +4525,8 @@ private:
                                 }
                             }
                         }
-                        {
-                            llama_tokens text;
-                            for (const auto t : slot.task->tokens.get_tokens()) {
-                                if (t == LLAMA_TOKEN_NULL) {
-                                    break;
-                                }
-                                text.push_back(t);
-                            }
+                        if (prefix_durable_active()) {
+                            llama_tokens text = durable_text_prefix(slot.task->tokens);
                             durable_recent_prompts.insert(durable_recent_prompts.begin(), std::move(text));
                             if (durable_recent_prompts.size() > DURABLE_RECENT_PROMPTS) {
                                 durable_recent_prompts.pop_back();
